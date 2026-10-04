@@ -1,6 +1,7 @@
 package heapx.parse;
 
 import heapx.model.HeapModel;
+import heapx.model.ThreadIndex;
 import org.netbeans.lib.profiler.heap.Field;
 import org.netbeans.lib.profiler.heap.FieldValue;
 import org.netbeans.lib.profiler.heap.GCRoot;
@@ -15,8 +16,10 @@ import java.io.File;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 /**
  * Reads a HotSpot HPROF file (4- or 8-byte identifiers, segmented dumps
@@ -28,12 +31,19 @@ public final class HprofParser {
     private final long maxObjects;
     private final long maxEdges;
 
+    /** Heap model plus the java.lang.Thread tid index used for JFR joins. */
+    public record ParseResult(HeapModel model, ThreadIndex threads) {}
+
     public HprofParser(long maxObjects, long maxEdges) {
         this.maxObjects = maxObjects;
         this.maxEdges = maxEdges;
     }
 
     public HeapModel parse(File dump) throws AnalysisException {
+        return parseFull(dump).model();
+    }
+
+    public ParseResult parseFull(File dump) throws AnalysisException {
         Heap heap;
         try {
             heap = HeapFactory.createHeap(dump);
@@ -52,7 +62,7 @@ public final class HprofParser {
         }
     }
 
-    private HeapModel build(Heap heap) throws AnalysisException {
+    private ParseResult build(Heap heap) throws AnalysisException {
         List<Instance> instances = new ArrayList<>();
         for (Object cls : heap.getAllClasses()) {
             instances.addAll(((JavaClass) cls).getInstances());
@@ -156,8 +166,68 @@ public final class HprofParser {
             inFrom[inCursor[to]] = from;
             inLabel[inCursor[to]++] = label;
         }
-        return new HeapModel(ids, classNames, shallow, root,
+        HeapModel model = new HeapModel(ids, classNames, shallow, root,
                 outStart, outTo, outLabel, inStart, inFrom, inLabel);
+        return new ParseResult(model, extractThreads(heap, index));
+    }
+
+    /**
+     * Reads the long field {@code tid} declared by java.lang.Thread from
+     * every Thread instance (subclasses included). A tid declared by more
+     * than one thread object is ambiguous and matches nothing; a thread
+     * object whose dump record lacks the field is counted as missing.
+     * Names, OS ids and monitor addresses are never used.
+     */
+    private static ThreadIndex extractThreads(Heap heap, Map<Long, Integer> index) {
+        Map<JavaClass, Boolean> isThread = new HashMap<>();
+        Map<Long, Long> unique = new HashMap<>();
+        Set<Long> ambiguous = new HashSet<>();
+        int threadObjects = 0;
+        int missingTid = 0;
+        for (Object clsObj : heap.getAllClasses()) {
+            JavaClass cls = (JavaClass) clsObj;
+            if (!isThreadClass(cls, isThread)) continue;
+            for (Object instObj : cls.getInstances()) {
+                Instance in = (Instance) instObj;
+                threadObjects++;
+                Long tid = readTid(in);
+                if (tid == null) { missingTid++; continue; }
+                if (ambiguous.contains(tid)) continue;
+                Long prev = unique.put(tid, in.getInstanceId());
+                if (prev != null) {
+                    unique.remove(tid);
+                    ambiguous.add(tid);
+                }
+            }
+        }
+        return new ThreadIndex(unique, ambiguous, threadObjects, missingTid);
+    }
+
+    private static boolean isThreadClass(JavaClass cls, Map<JavaClass, Boolean> cache) {
+        Boolean cached = cache.get(cls);
+        if (cached != null) return cached;
+        boolean result = false;
+        for (JavaClass c = cls; c != null; c = c.getSuperClass()) {
+            if ("java.lang.Thread".equals(c.getName())) { result = true; break; }
+        }
+        cache.put(cls, result);
+        return result;
+    }
+
+    private static Long readTid(Instance in) {
+        for (Object fvObj : in.getFieldValues()) {
+            FieldValue fv = (FieldValue) fvObj;
+            Field f = fv.getField();
+            if (!"tid".equals(f.getName())) continue;
+            if (!"java.lang.Thread".equals(f.getDeclaringClass().getName())) continue;
+            if (!"long".equals(f.getType().getName())) continue;
+            try {
+                return Long.parseLong(fv.getValue().trim());
+            } catch (RuntimeException e) {
+                return null;
+            }
+        }
+        return null;
     }
 
     private AnalysisException edgeLimit(long count) {

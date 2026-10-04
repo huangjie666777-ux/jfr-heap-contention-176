@@ -2,6 +2,7 @@ package heapx.service;
 
 import heapx.graph.DominatorAnalysis;
 import heapx.model.HeapModel;
+import heapx.model.ThreadIndex;
 
 import java.nio.file.Path;
 
@@ -12,13 +13,16 @@ public final class Analysis {
     public final String id;
     public final HeapModel model;
     public final DominatorAnalysis dominators;
+    public final ThreadIndex threads;
     public final Path source;
     public final long createdAtMillis;
 
-    public Analysis(String id, HeapModel model, DominatorAnalysis dominators, Path source) {
+    public Analysis(String id, HeapModel model, DominatorAnalysis dominators,
+                    ThreadIndex threads, Path source) {
         this.id = id;
         this.model = model;
         this.dominators = dominators;
+        this.threads = threads;
         this.source = source;
         this.createdAtMillis = System.currentTimeMillis();
     }

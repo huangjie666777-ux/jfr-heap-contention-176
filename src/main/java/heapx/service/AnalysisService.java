@@ -1,6 +1,8 @@
 package heapx.service;
 
 import heapx.graph.DominatorAnalysis;
+import heapx.jfr.ContentionRecording;
+import heapx.jfr.JfrParser;
 import heapx.mask.HprofArrays;
 import heapx.mask.MaskExporter;
 import heapx.mask.ScanResult;
@@ -13,10 +15,12 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.stream.Stream;
 
 /**
  * Parses uploads, runs dominator analysis and hands out independent
@@ -35,6 +39,7 @@ public final class AnalysisService {
 
     private final Map<String, Analysis> analyses = new ConcurrentHashMap<>();
     private final Map<String, ScanResult> scans = new ConcurrentHashMap<>();
+    private final Map<String, ContentionRecording> recordings = new ConcurrentHashMap<>();
     private final HprofParser parser = new HprofParser(MAX_OBJECTS, MAX_EDGES);
 
     public Analysis analyze(InputStream in) throws AnalysisException {
@@ -43,9 +48,11 @@ public final class AnalysisService {
         try {
             tmp = Files.createTempFile("heapx-upload-", ".hprof");
             copyBounded(in, tmp);
-            HeapModel model = parser.parse(tmp.toFile());
+            HprofParser.ParseResult parsed = parser.parseFull(tmp.toFile());
+            HeapModel model = parsed.model();
             DominatorAnalysis da = DominatorAnalysis.compute(model);
-            Analysis a = new Analysis(UUID.randomUUID().toString(), model, da, tmp);
+            Analysis a = new Analysis(UUID.randomUUID().toString(), model, da,
+                    parsed.threads(), tmp);
             analyses.put(a.id, a);
             published = true;
             return a;
@@ -56,7 +63,7 @@ public final class AnalysisService {
             throw new AnalysisException(400, "failed to store upload: " + e.getMessage());
         } finally {
             if (!published && tmp != null) {
-                try { Files.deleteIfExists(tmp); } catch (IOException ignored) {}
+                cleanupDump(tmp);
             }
         }
     }
@@ -115,12 +122,63 @@ public final class AnalysisService {
 
     public Analysis get(String id) { return analyses.get(id); }
 
+    /**
+     * Parses an uploaded JFR recording (real file only, never JSON) and
+     * publishes it bound to the analysis. Corrupt or over-limit uploads
+     * publish nothing; the temporary file is always removed.
+     */
+    public ContentionRecording addRecording(String analysisId, InputStream in)
+            throws AnalysisException {
+        Analysis a = analyses.get(analysisId);
+        if (a == null) return null;
+        Path tmp = null;
+        boolean published = false;
+        try {
+            tmp = Files.createTempFile("heapx-jfr-", ".jfr");
+            copyBounded(in, tmp);
+            var events = JfrParser.parse(tmp);
+            ContentionRecording rec = new ContentionRecording(
+                    UUID.randomUUID().toString(), analysisId, events);
+            recordings.put(rec.recordingId, rec);
+            published = true;
+            return rec;
+        } catch (TooLargeException e) {
+            throw new AnalysisException(422,
+                    "file limit exceeded: JFR upload is larger than " + MAX_BYTES + " bytes (100 MiB)");
+        } catch (IOException e) {
+            throw new AnalysisException(400, "failed to store JFR upload: " + e.getMessage());
+        } finally {
+            if (tmp != null) {
+                try { Files.deleteIfExists(tmp); } catch (IOException ignored) {}
+            }
+        }
+    }
+
+    public ContentionRecording getRecording(String analysisId, String recordingId) {
+        ContentionRecording r = recordings.get(recordingId);
+        return r != null && r.analysisId.equals(analysisId) ? r : null;
+    }
+
     public boolean delete(String id) {
         Analysis a = analyses.remove(id);
         if (a == null) return false;
         scans.values().removeIf(s -> s.analysisId.equals(id));
-        try { Files.deleteIfExists(a.source); } catch (IOException ignored) {}
+        recordings.values().removeIf(r -> r.analysisId.equals(id));
+        cleanupDump(a.source);
         return true;
+    }
+
+    /** Removes the retained dump plus the NetBeans reader cache directory
+     *  ({@code <dump>.nbcache}) that HeapFactory leaves next to the file. */
+    private static void cleanupDump(Path dump) {
+        try { Files.deleteIfExists(dump); } catch (IOException ignored) {}
+        Path cache = dump.resolveSibling(dump.getFileName() + ".nbcache");
+        if (!Files.exists(cache)) return;
+        try (Stream<Path> walk = Files.walk(cache)) {
+            walk.sorted(Comparator.reverseOrder()).forEach(p -> {
+                try { Files.deleteIfExists(p); } catch (IOException ignored) {}
+            });
+        } catch (IOException ignored) {}
     }
 
     public int count() { return analyses.size(); }

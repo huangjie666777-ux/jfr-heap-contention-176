@@ -35,6 +35,7 @@ java -jar target/heapx-1.0.0-jar-with-dependencies.jar
 - 文件 ≤ 100 MiB（超限 422，请求体超限 413）
 - 对象 ≤ 50,000（`HEAPX_MAX_OBJECTS` 可调）
 - 边 ≤ 200,000（`HEAPX_MAX_EDGES` 可调）
+- JFR 录制 ≤ 100 MiB；`jdk.JavaMonitorEnter` 争用事件 ≤ 100,000 条（超限 422）
 - 损坏文件返回 400；任何失败都不会发布半份分析。
 - 每次上传得到独立 `analysisId`，并发上传/查询互不影响；
   `DELETE` 释放全部资源，无持久化。
@@ -52,7 +53,45 @@ java -jar target/heapx-1.0.0-jar-with-dependencies.jar
 | POST | `/api/analyses/{id}/scans` | 提交敏感值规则并扫描 byte[]/char[] 载荷，返回不可变 scanId 与全部命中 |
 | GET | `/api/analyses/{id}/scans/{scanId}` | 按 scanId 读取扫描结果（不可变，可重复查询） |
 | GET | `/api/analyses/{id}/scans/{scanId}/export` | 下载遮除后的真实 HPROF 副本（命中区间并集置零） |
+| POST | `/api/analyses/{id}/recordings` | 上传同一 JVM 的真实 JFR（multipart 字段 `file` 或原始请求体），返回 `recordingId` |
+| GET | `/api/analyses/{id}/recordings/{recordingId}` | 录制概要（事件数、起止、线程索引统计） |
+| GET | `/api/analyses/{id}/recordings/{recordingId}/contention?from=...&to=...` | ISO-8601 UTC 左闭右开窗口查询：相交事件、裁剪时长、按线程/锁类聚合 |
 | DELETE | `/api/analyses/{id}` | 删除分析并释放资源（源转储、扫描结果一并清理） |
+
+## JFR 锁争用联查
+
+在同一分析（analysisId）上上传**同一 JVM** 的真实 JFR 录制文件，用
+`jdk.jfr.consumer` 读取 `jdk.JavaMonitorEnter` 事件（其余事件类型一律忽略），
+与堆证据联查卡顿来源。
+
+- **上传**：POST `/api/analyses/{id}/recordings`，multipart 字段 `file` 或原始
+  请求体；只接受真实录制文件，**JSON 元数据不能替代录制**（`application/json`
+  一律 400）。成功返回 `recordingId`、事件数、首事件开始与末事件结束。
+- **事件口径**：每条事件保存开始/结束（UTC）、Java 线程 ID
+  （`RecordedThread.getJavaThreadId()`）、锁类（`monitorClass`）与栈帧
+  （最多 64 帧）。
+- **线程关联**：从 HPROF 的 `java.lang.Thread`（含子类）实例读取
+  `java.lang.Thread` 声明的 long 字段 `tid`，与 JFR 的 Java 线程 ID 精确
+  关联——绝不使用线程名、OS 线程 ID 或监视器地址。同一 tid 被多个 Thread
+  对象声明 → `ambiguous`；无对应 Thread 对象 → `unmatched`；Thread 对象缺
+  `tid` 字段计入 `missingTid`。未匹配/歧义事件全部保留，只是不附堆证据。
+- **窗口查询**：GET `.../contention?from=<ISO8601 UTC>&to=<ISO8601 UTC>`，
+  左闭右开 `[from, to)`。返回与窗口相交的事件及**裁剪后**时长
+  （`clippedStart/clippedEnd/clippedNanos`），并按线程汇总：事件数、等待区间
+  **并集**纳秒数、按锁类分组的并集时长。先裁剪再合并，同线程重叠区间不重复
+  计数。`eventLimit`（默认 1000）只截断事件清单，聚合始终基于全部相交事件。
+- **堆证据**：已匹配线程附堆对象 ID、原保留字节（支配子树口径，与
+  `/retained` 一致）与最短根路径；不可达线程对象标记 `unreachable: true`
+  且不给保留值。
+- **解释边界**：结果仅反映**已录制**的争用，不断言死锁或内存泄漏；JFR 与堆
+  转储采集时刻不同，不视为同时快照。
+
+限制与生命周期：
+
+- JFR 文件 ≤ 100 MiB（超限 422，请求体超限 413）；争用事件 ≤ 100,000 条（超限 422）。
+- 损坏或非 JFR 文件 400；任何失败都不发布录制结果；录制按 analysisId 隔离。
+- 删除分析会一并清理其全部录制、源转储与 NetBeans 读取器留下的
+  `<dump>.nbcache` 缓存目录（此前版本删除分析时该目录会残留）。
 
 ## 断引用规划（cut-plan）
 
@@ -207,6 +246,47 @@ curl -s -X POST "http://localhost:7717/api/analyses/<analysisId>/cut-plan" \
 curl -s -X DELETE "http://localhost:7717/api/analyses/<analysisId>"
 ```
 
+## curl 演示（真实 JFR + HPROF 联查）
+
+```bash
+# 同一 JVM 制造真实锁争用并同时采集 JFR 与堆转储
+cd demo && javac ContentionDemo.java
+java -XX:StartFlightRecording=filename=contention.jfr,settings=profile ContentionDemo &
+PID=$!   # 4 个 worker 在共享监视器上争用约 1 秒，随后 JVM 驻留
+sleep 10
+jcmd $PID JFR.dump filename=contention.jfr
+jmap -dump:live,format=b,file=contention.hprof $PID
+
+# 上传堆转储（真实 JVM 活动对象可能超过默认 5 万对象上限，
+# 可用 HEAPX_MAX_OBJECTS=150000 启动服务，或使用 -dump:live 缩小堆）
+curl -s http://localhost:7717/api/analyses -F "file=@contention.hprof"
+# => {"analysisId":"d106b5bb-...","objects":73125,"edges":121376,"unreachableObjects":7296}
+
+# 上传同一 JVM 的 JFR（multipart 或原始请求体；JSON 一律 400）
+curl -s http://localhost:7717/api/analyses/<analysisId>/recordings -F "file=@contention.jfr"
+# => {"recordingId":"6a0e1e6b-...","events":81,
+#     "firstEventStart":"2026-10-04T14:47:27.703730596Z",
+#     "lastEventEnd":"2026-10-04T14:47:28.442721891Z",
+#     "threadIndex":{"threadObjects":29,"uniqueTids":29,"ambiguousTids":0,"missingTid":0}}
+
+# 全窗口查询：81 条事件，4 个争用线程全部经 Thread.tid 匹配到堆对象
+curl -s "http://localhost:7717/api/analyses/<analysisId>/recordings/<recordingId>/contention\
+  ?from=2026-10-04T14:47:27.703730596Z&to=2026-10-04T14:47:28.442721891Z&eventLimit=1"
+# => threads: [
+#      {"javaThreadId":26,"threadMatch":"matched","events":21,"waitNanos":575434553,
+#       "heapObjectId":"0x70e8f9408","retainedBytes":236,
+#       "rootPath":{"rootObjectId":"0x70e8f01f0","pathLength":1,
+#                   "edges":[{"fromClass":"java.lang.Thread[]","via":"[1]",...}]},
+#       "locks":[{"monitorClass":"java.lang.Object","events":21,"waitNanos":575434553}]}, ...]
+
+# 裁剪窗口（左闭右开）：相交 30 条，等待时长按裁剪后区间并集计算
+curl -s ".../contention?from=2026-10-04T14:47:27.75Z&to=2026-10-04T14:47:28.00Z&eventLimit=0"
+# => intersectingEvents: 30；每线程 events 7-8、waitNanos 为裁剪后并集
+
+# 删除分析：录制、源转储与 .nbcache 一并清理，随后一切请求 404
+curl -s -X DELETE http://localhost:7717/api/analyses/<analysisId>
+```
+
 ## 代码结构
 
 - `heapx.parse.HprofParser` — NetBeans 读取器 → 对象/浅堆/边/根，执行限制
@@ -221,8 +301,18 @@ curl -s -X DELETE "http://localhost:7717/api/analyses/<analysisId>"
   ASCII 精确匹配，产出绑定不可变 scanId 的命中清单（含根路径）
 - `heapx.mask.MaskExporter` — 命中区间并集置零生成真实 HPROF 副本，
   统计去重数组数与实际改写
+- `heapx.jfr.JfrParser` — `jdk.jfr.consumer` 读取真实 JFR，仅保留
+  `jdk.JavaMonitorEnter`（起止、Java 线程 ID、锁类、栈），其余事件忽略；
+  损坏文件 400，事件超限 422
+- `heapx.jfr.ContentionRecording` / `ContentionEvent` — 绑定 analysisId 的
+  不可变录制与事件模型
+- `heapx.jfr.WindowAggregator` — 左闭右开窗口相交、先裁剪再合并的区间并集
+  聚合（按线程与锁类）
+- `heapx.model.ThreadIndex` — HPROF `java.lang.Thread`（含子类）声明的
+  long `tid` 索引：唯一匹配 / 歧义 / 缺失
 - `heapx.service.AnalysisService` — 分析注册表、限制、并发隔离、删除
-  （保留源转储供扫描/导出，删除时清理源文件与扫描结果）
+  （保留源转储供扫描/导出，删除时清理源文件、扫描结果、JFR 录制与
+  `.nbcache` 缓存目录）
 - `heapx.http.Api` / `heapx.Main` — Javalin 路由与启动
 
 ## 测试
@@ -245,3 +335,9 @@ mvn -B test
   不可达对象，并走完整 HTTP 上传 → 排行 → 根路径 → 断引用规划 → 删除流程；
   另验证对象/边超限、损坏文件与非法规划请求（重复候选、非法代价、
   不存在的引用）的拒绝。
+- `JfrContentionTest`：测试 JVM 内用 `jdk.jfr.Recording` 录制**真实**锁争用
+  （3 个线程争同一监视器），配合含 `java.lang.Thread#tid` 的合成 HPROF
+  （唯一匹配、重复 tid 歧义、无事件 tid、子类 Thread、缺 tid 字段）走完整
+  HTTP 流程：上传 → 录制概要 → 全窗口/裁剪窗口查询 → 删除 404；另含
+  窗口聚合单元测试（先裁剪再合并、重叠不重复计数、左闭右开边界）、
+  损坏 JFR 与 JSON 替代上传的 400 拒绝、删除时 `.nbcache` 残留清理。

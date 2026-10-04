@@ -2,10 +2,14 @@ package heapx.http;
 
 import heapx.graph.PathFinder;
 import heapx.graph.CutPlanner;
+import heapx.jfr.ContentionEvent;
+import heapx.jfr.ContentionRecording;
+import heapx.jfr.WindowAggregator;
 import heapx.mask.MaskExporter;
 import heapx.mask.ScanResult;
 import heapx.mask.SensitiveScanner;
 import heapx.model.HeapModel;
+import heapx.model.ThreadIndex;
 import heapx.parse.AnalysisException;
 import heapx.service.Analysis;
 import heapx.service.AnalysisService;
@@ -18,6 +22,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.InputStream;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
@@ -289,8 +294,190 @@ public final class Api {
             ctx.result(masked.data());
         });
 
+        app.post("/api/analyses/{id}/recordings", ctx -> {
+            Analysis a = require(ctx, service);
+            if (a == null) return;
+            String ct = ctx.contentType();
+            if (ct != null && ct.toLowerCase().startsWith("application/json")) {
+                ctx.status(HttpStatus.BAD_REQUEST).json(Map.of("error",
+                        "a real JFR recording file is required (multipart field 'file' or raw "
+                                + "request body); JSON metadata is not accepted as a substitute"));
+                return;
+            }
+            try (InputStream in = bodyOf(ctx)) {
+                if (in == null) {
+                    ctx.status(HttpStatus.BAD_REQUEST).json(Map.of("error",
+                            "provide the JFR file as multipart field 'file' or raw request body"));
+                    return;
+                }
+                ContentionRecording rec = service.addRecording(a.id, in);
+                LOG.info("recording {} published for analysis {}: {} contention events",
+                        rec.recordingId, a.id, rec.events.size());
+                ctx.status(HttpStatus.CREATED).json(recordingJson(a, rec));
+            } catch (AnalysisException e) {
+                ctx.status(e.status).json(Map.of("error", e.getMessage()));
+            }
+        });
+
+        app.get("/api/analyses/{id}/recordings/{recordingId}", ctx -> {
+            Analysis a = require(ctx, service);
+            if (a == null) return;
+            ContentionRecording rec = requireRecording(ctx, service, a);
+            if (rec != null) ctx.json(recordingJson(a, rec));
+        });
+
+        app.get("/api/analyses/{id}/recordings/{recordingId}/contention", ctx -> {
+            Analysis a = require(ctx, service);
+            if (a == null) return;
+            ContentionRecording rec = requireRecording(ctx, service, a);
+            if (rec == null) return;
+            Instant from = instantParam(ctx, "from");
+            if (from == null) return;
+            Instant to = instantParam(ctx, "to");
+            if (to == null) return;
+            if (!from.isBefore(to)) {
+                badRequest(ctx, "invalid window: 'from' must be strictly before 'to' "
+                        + "(left-closed, right-open)");
+                return;
+            }
+            int eventLimit = Math.min(intParam(ctx, "eventLimit", 1000), 100_000);
+            WindowAggregator.Result res = WindowAggregator.query(rec.events, from, to);
+            ctx.json(contentionJson(a, res, eventLimit));
+        });
+
         app.start(port);
         return app;
+    }
+
+    private static ContentionRecording requireRecording(Context ctx, AnalysisService service,
+                                                        Analysis a) {
+        ContentionRecording rec = service.getRecording(a.id, ctx.pathParam("recordingId"));
+        if (rec == null) {
+            ctx.status(HttpStatus.NOT_FOUND).json(Map.of("error", "unknown recording id"));
+        }
+        return rec;
+    }
+
+    private static Instant instantParam(Context ctx, String name) {
+        String v = ctx.queryParam(name);
+        if (v == null) {
+            badRequest(ctx, "missing query parameter '" + name
+                    + "' (ISO-8601 UTC, e.g. 2026-10-04T14:00:00Z)");
+            return null;
+        }
+        try {
+            return Instant.parse(v);
+        } catch (RuntimeException e) {
+            badRequest(ctx, "invalid '" + name + "': expected ISO-8601 UTC instant, got " + v);
+            return null;
+        }
+    }
+
+    private static Map<String, Object> recordingJson(Analysis a, ContentionRecording rec) {
+        Map<String, Object> m = new LinkedHashMap<>();
+        m.put("analysisId", a.id);
+        m.put("recordingId", rec.recordingId);
+        m.put("events", rec.events.size());
+        m.put("firstEventStart", rec.firstStart == null ? null : rec.firstStart.toString());
+        m.put("lastEventEnd", rec.lastEnd == null ? null : rec.lastEnd.toString());
+        Map<String, Object> threads = new LinkedHashMap<>();
+        threads.put("threadObjects", a.threads.threadObjects);
+        threads.put("uniqueTids", a.threads.tidToObjectId.size());
+        threads.put("ambiguousTids", a.threads.ambiguousTids.size());
+        threads.put("missingTid", a.threads.missingTid);
+        m.put("threadIndex", threads);
+        m.put("note", "recorded contention only; the JFR and the heap dump were captured "
+                + "at different times and are not simultaneous snapshots");
+        return m;
+    }
+
+    private static Map<String, Object> contentionJson(Analysis a, WindowAggregator.Result res,
+                                                      int eventLimit) {
+        Map<String, Object> m = new LinkedHashMap<>();
+        m.put("analysisId", a.id);
+        Map<String, Object> window = new LinkedHashMap<>();
+        window.put("from", res.from().toString());
+        window.put("to", res.to().toString());
+        window.put("semantics", "left-closed, right-open; events clipped to the window, "
+                + "overlaps of the same thread merged after clipping");
+        m.put("window", window);
+        m.put("intersectingEvents", res.events().size());
+
+        List<Map<String, Object>> events = new ArrayList<>();
+        int shown = 0;
+        for (WindowAggregator.ClippedEvent ce : res.events()) {
+            if (shown++ >= eventLimit) break;
+            ContentionEvent e = ce.event();
+            Map<String, Object> ev = new LinkedHashMap<>();
+            ev.put("start", e.start().toString());
+            ev.put("end", e.end().toString());
+            ev.put("durationNanos", e.durationNanos());
+            ev.put("clippedStart", ce.start().toString());
+            ev.put("clippedEnd", ce.end().toString());
+            ev.put("clippedNanos", ce.nanos());
+            ev.put("javaThreadId", e.javaThreadId());
+            ev.put("monitorClass", e.monitorClass());
+            ev.put("threadMatch", a.threads.statusOf(e.javaThreadId())
+                    .name().toLowerCase());
+            ev.put("stack", e.stack());
+            events.add(ev);
+        }
+        m.put("events", events);
+        m.put("eventsTruncated", res.events().size() > events.size());
+
+        List<Map<String, Object>> threads = new ArrayList<>();
+        for (WindowAggregator.ThreadAgg t : res.threads()) {
+            Map<String, Object> row = new LinkedHashMap<>();
+            row.put("javaThreadId", t.javaThreadId());
+            row.put("events", t.events());
+            row.put("waitNanos", t.waitNanos());
+            List<Map<String, Object>> locks = new ArrayList<>();
+            for (WindowAggregator.LockAgg l : t.locks()) {
+                Map<String, Object> lk = new LinkedHashMap<>();
+                lk.put("monitorClass", l.monitorClass());
+                lk.put("events", l.events());
+                lk.put("waitNanos", l.waitNanos());
+                locks.add(lk);
+            }
+            row.put("locks", locks);
+            attachHeapEvidence(a, t.javaThreadId(), row);
+            threads.add(row);
+        }
+        m.put("threads", threads);
+        return m;
+    }
+
+    /** Joins a JFR Java thread id to the heap via the HPROF Thread.tid
+     *  index only (never names, OS ids or monitor addresses). */
+    private static void attachHeapEvidence(Analysis a, long tid, Map<String, Object> row) {
+        ThreadIndex.Status status = a.threads.statusOf(tid);
+        row.put("threadMatch", status.name().toLowerCase());
+        if (status != ThreadIndex.Status.MATCHED) {
+            row.put("heapObjectId", null);
+            return;
+        }
+        long objectId = a.threads.objectIdOf(tid);
+        Integer idx = a.model.indexOf(objectId);
+        row.put("heapObjectId", hex(objectId));
+        if (idx == null) return;
+        HeapModel g = a.model;
+        row.put("unreachable", a.dominators.unreachable[idx]);
+        if (a.dominators.unreachable[idx]) {
+            row.put("retainedBytes", null);
+            row.put("rootPath", null);
+            return;
+        }
+        row.put("retainedBytes", a.dominators.retained[idx]);
+        List<PathFinder.Step> steps = PathFinder.shortestPathFromRoot(g, a.dominators, idx);
+        if (steps == null) {
+            row.put("rootPath", null);
+            return;
+        }
+        Map<String, Object> path = new LinkedHashMap<>();
+        path.put("rootObjectId", steps.isEmpty() ? hex(g.ids[idx]) : hex(steps.get(0).fromId()));
+        path.put("pathLength", steps.size());
+        path.put("edges", edgesJson(steps));
+        row.put("rootPath", path);
     }
 
 
