@@ -1,6 +1,8 @@
 package heapx.service;
 
 import heapx.graph.DominatorAnalysis;
+import heapx.jfr.ContentionEvent;
+import heapx.jfr.JfrParser;
 import heapx.mask.HprofArrays;
 import heapx.mask.MaskExporter;
 import heapx.mask.ScanResult;
@@ -13,10 +15,12 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.stream.Stream;
 
 /**
  * Parses uploads, runs dominator analysis and hands out independent
@@ -26,6 +30,7 @@ import java.util.concurrent.ConcurrentHashMap;
  */
 public final class AnalysisService {
     public static final long MAX_BYTES = 100L * 1024 * 1024;
+    public static final long MAX_JFR_BYTES = 100L * 1024 * 1024;
     public static final long MAX_OBJECTS =
             Long.parseLong(System.getenv().getOrDefault("HEAPX_MAX_OBJECTS", "50000"));
     public static final long MAX_EDGES =
@@ -35,6 +40,7 @@ public final class AnalysisService {
 
     private final Map<String, Analysis> analyses = new ConcurrentHashMap<>();
     private final Map<String, ScanResult> scans = new ConcurrentHashMap<>();
+    private final Map<String, Recording> recordings = new ConcurrentHashMap<>();
     private final HprofParser parser = new HprofParser(MAX_OBJECTS, MAX_EDGES);
 
     public Analysis analyze(InputStream in) throws AnalysisException {
@@ -56,22 +62,59 @@ public final class AnalysisService {
             throw new AnalysisException(400, "failed to store upload: " + e.getMessage());
         } finally {
             if (!published && tmp != null) {
-                try { Files.deleteIfExists(tmp); } catch (IOException ignored) {}
+                deleteDumpArtifacts(tmp);
             }
         }
     }
 
     private static void copyBounded(InputStream in, Path target) throws IOException {
+        copyBounded(in, target, MAX_BYTES);
+    }
+
+    private static void copyBounded(InputStream in, Path target, long maxBytes) throws IOException {
         long total = 0;
         byte[] buf = new byte[1 << 16];
         try (var out = Files.newOutputStream(target)) {
             int r;
             while ((r = in.read(buf)) != -1) {
                 total += r;
-                if (total > MAX_BYTES) throw new TooLargeException();
+                if (total > maxBytes) throw new TooLargeException();
                 out.write(buf, 0, r);
             }
         }
+    }
+
+    /** Parses a JFR upload for the given analysis and keeps only
+     *  jdk.JavaMonitorEnter contention events. Failed or over-limit
+     *  uploads publish nothing. */
+    public Recording addRecording(String analysisId, InputStream in) throws AnalysisException {
+        Analysis a = analyses.get(analysisId);
+        if (a == null) return null;
+        Path tmp = null;
+        boolean published = false;
+        try {
+            tmp = Files.createTempFile("heapx-jfr-", ".jfr");
+            copyBounded(in, tmp, MAX_JFR_BYTES);
+            List<ContentionEvent> events = JfrParser.parse(tmp);
+            Recording r = new Recording(UUID.randomUUID().toString(), analysisId, events, tmp);
+            recordings.put(r.id, r);
+            published = true;
+            return r;
+        } catch (TooLargeException e) {
+            throw new AnalysisException(422,
+                    "file limit exceeded: JFR upload is larger than " + MAX_JFR_BYTES + " bytes (100 MiB)");
+        } catch (IOException e) {
+            throw new AnalysisException(400, "failed to store upload: " + e.getMessage());
+        } finally {
+            if (!published && tmp != null) {
+                try { Files.deleteIfExists(tmp); } catch (IOException ignored) {}
+            }
+        }
+    }
+
+    public Recording getRecording(String analysisId, String recordingId) {
+        Recording r = recordings.get(recordingId);
+        return r != null && r.analysisId.equals(analysisId) ? r : null;
     }
 
     /** Runs a sensitive-value scan over the retained source dump. The scan
@@ -119,8 +162,27 @@ public final class AnalysisService {
         Analysis a = analyses.remove(id);
         if (a == null) return false;
         scans.values().removeIf(s -> s.analysisId.equals(id));
-        try { Files.deleteIfExists(a.source); } catch (IOException ignored) {}
+        List<Recording> removed = recordings.values().stream()
+                .filter(r -> r.analysisId.equals(id)).toList();
+        recordings.values().removeIf(r -> r.analysisId.equals(id));
+        for (Recording r : removed) {
+            try { Files.deleteIfExists(r.source); } catch (IOException ignored) {}
+        }
+        deleteDumpArtifacts(a.source);
         return true;
+    }
+
+    /** Removes the retained dump plus the NetBeans reader cache directory
+     *  ({<file>.nbcache}) it may leave next to the dump. */
+    static void deleteDumpArtifacts(Path source) {
+        try { Files.deleteIfExists(source); } catch (IOException ignored) {}
+        Path cache = source.resolveSibling(source.getFileName() + ".nbcache");
+        if (!Files.exists(cache)) return;
+        try (Stream<Path> walk = Files.walk(cache)) {
+            walk.sorted(Comparator.reverseOrder()).forEach(p -> {
+                try { Files.deleteIfExists(p); } catch (IOException ignored) {}
+            });
+        } catch (IOException ignored) {}
     }
 
     public int count() { return analyses.size(); }

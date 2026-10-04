@@ -2,6 +2,9 @@ package heapx.http;
 
 import heapx.graph.PathFinder;
 import heapx.graph.CutPlanner;
+import heapx.jfr.ContentionEvent;
+import heapx.jfr.ContentionQuery;
+import heapx.jfr.JfrParser;
 import heapx.mask.MaskExporter;
 import heapx.mask.ScanResult;
 import heapx.mask.SensitiveScanner;
@@ -9,6 +12,7 @@ import heapx.model.HeapModel;
 import heapx.parse.AnalysisException;
 import heapx.service.Analysis;
 import heapx.service.AnalysisService;
+import heapx.service.Recording;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.javalin.Javalin;
@@ -18,7 +22,9 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.InputStream;
+import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -289,8 +295,183 @@ public final class Api {
             ctx.result(masked.data());
         });
 
+        app.post("/api/analyses/{id}/recordings", ctx -> {
+            Analysis a = require(ctx, service);
+            if (a == null) return;
+            try (InputStream in = bodyOf(ctx)) {
+                if (in == null) {
+                    ctx.status(HttpStatus.BAD_REQUEST).json(Map.of("error",
+                            "provide the JFR file as multipart field 'file' or raw request body"));
+                    return;
+                }
+                Recording r = service.addRecording(a.id, in);
+                LOG.info("recording {} created for analysis {}: {} contention events",
+                        r.id, a.id, r.events.size());
+                ctx.status(HttpStatus.CREATED).json(recordingJson(r));
+            } catch (AnalysisException e) {
+                ctx.status(e.status).json(Map.of("error", e.getMessage()));
+            }
+        });
+
+        app.get("/api/analyses/{id}/recordings/{rid}", ctx -> {
+            Analysis a = require(ctx, service);
+            if (a == null) return;
+            Recording r = requireRecording(ctx, service, a);
+            if (r != null) ctx.json(recordingJson(r));
+        });
+
+        app.get("/api/analyses/{id}/recordings/{rid}/contention", ctx -> {
+            Analysis a = require(ctx, service);
+            if (a == null) return;
+            Recording r = requireRecording(ctx, service, a);
+            if (r == null) return;
+            String fromParam = ctx.queryParam("from");
+            String toParam = ctx.queryParam("to");
+            if (fromParam == null || toParam == null) {
+                badRequest(ctx, "query params 'from' and 'to' (ISO-8601 UTC, half-open [from, to)) are required");
+                return;
+            }
+            Instant from;
+            Instant to;
+            try {
+                from = Instant.parse(fromParam);
+                to = Instant.parse(toParam);
+            } catch (RuntimeException e) {
+                badRequest(ctx, "invalid ISO-8601 UTC instant: " + e.getMessage());
+                return;
+            }
+            if (!from.isBefore(to)) {
+                badRequest(ctx, "'from' must be strictly before 'to'");
+                return;
+            }
+            long fromNanos = JfrParser.toEpochNanos(from);
+            long toNanos = JfrParser.toEpochNanos(to);
+            List<ContentionQuery.ClippedEvent> clipped =
+                    ContentionQuery.clip(r.events, fromNanos, toNanos);
+
+            List<Map<String, Object>> eventRows = new ArrayList<>();
+            Map<Long, List<ContentionQuery.ClippedEvent>> byThread = new LinkedHashMap<>();
+            for (ContentionQuery.ClippedEvent ce : clipped) {
+                ContentionEvent e = ce.event();
+                Map<String, Object> row = new LinkedHashMap<>();
+                row.put("start", instantOfNanos(ce.clipStart()));
+                row.put("end", instantOfNanos(ce.clipEnd()));
+                row.put("durationNanos", ce.durationNanos());
+                row.put("javaThreadId", e.javaThreadId());
+                row.put("monitorClass", e.monitorClass());
+                row.put("stack", e.stack());
+                row.put("threadMatch", threadMatchJson(a, e.javaThreadId()));
+                eventRows.add(row);
+                byThread.computeIfAbsent(e.javaThreadId(), k -> new ArrayList<>()).add(ce);
+            }
+
+            List<Map<String, Object>> threadRows = new ArrayList<>();
+            byThread.entrySet().stream()
+                    .sorted(Map.Entry.<Long, List<ContentionQuery.ClippedEvent>>comparingByKey())
+                    .forEach(en -> {
+                        long tid = en.getKey();
+                        List<ContentionQuery.ClippedEvent> evs = en.getValue();
+                        List<long[]> intervals = new ArrayList<>();
+                        Map<String, List<long[]>> byClass = new LinkedHashMap<>();
+                        for (ContentionQuery.ClippedEvent ce : evs) {
+                            intervals.add(new long[]{ce.clipStart(), ce.clipEnd()});
+                            byClass.computeIfAbsent(ce.event().monitorClass(), k -> new ArrayList<>())
+                                    .add(new long[]{ce.clipStart(), ce.clipEnd()});
+                        }
+                        List<Map<String, Object>> classRows = new ArrayList<>();
+                        byClass.forEach((cls, ivs) -> classRows.add(Map.of(
+                                "monitorClass", cls,
+                                "waitNanos", ContentionQuery.unionNanos(ivs))));
+                        classRows.sort(Comparator.comparingLong(
+                                (Map<String, Object> m) -> (long) m.get("waitNanos")).reversed());
+                        Map<String, Object> t = new LinkedHashMap<>();
+                        t.put("javaThreadId", tid);
+                        t.put("events", evs.size());
+                        t.put("waitNanos", ContentionQuery.unionNanos(intervals));
+                        t.put("monitorClasses", classRows);
+                        t.put("threadMatch", threadMatchJson(a, tid));
+                        threadRows.add(t);
+                    });
+
+            Map<String, Object> resp = new LinkedHashMap<>();
+            resp.put("analysisId", a.id);
+            resp.put("recordingId", r.id);
+            resp.put("from", from.toString());
+            resp.put("to", to.toString());
+            resp.put("events", eventRows);
+            resp.put("threads", threadRows);
+            resp.put("caveats", List.of(
+                    "reflects recorded jdk.JavaMonitorEnter contention only; no deadlock or leak is asserted",
+                    "JFR recording and heap dump were captured at different times, not a simultaneous snapshot"));
+            ctx.json(resp);
+        });
+
         app.start(port);
         return app;
+    }
+
+    private static Recording requireRecording(Context ctx, AnalysisService service, Analysis a) {
+        Recording r = service.getRecording(a.id, ctx.pathParam("rid"));
+        if (r == null) {
+            ctx.status(HttpStatus.NOT_FOUND).json(Map.of("error", "unknown recording id"));
+        }
+        return r;
+    }
+
+    private static Map<String, Object> recordingJson(Recording r) {
+        Map<String, Object> m = new LinkedHashMap<>();
+        m.put("analysisId", r.analysisId);
+        m.put("recordingId", r.id);
+        m.put("events", r.events.size());
+        m.put("firstEventStart", r.events.isEmpty() ? null : instantOfNanos(r.minStartNanos));
+        m.put("lastEventEnd", r.events.isEmpty() ? null : instantOfNanos(r.maxEndNanos));
+        return m;
+    }
+
+    /** Joins a JFR Java thread id to the heap via the declared long 'tid'
+     *  of java.lang.Thread: exactly one match -> heap evidence; none ->
+     *  unmatched; several -> ambiguous. Events are kept either way. */
+    private static Map<String, Object> threadMatchJson(Analysis a, long javaThreadId) {
+        Map<String, Object> m = new LinkedHashMap<>();
+        List<Long> objects = javaThreadId < 0 ? null : a.model.threadTids.get(javaThreadId);
+        if (objects == null || objects.isEmpty()) {
+            m.put("status", "unmatched");
+            return m;
+        }
+        if (objects.size() > 1) {
+            m.put("status", "ambiguous");
+            List<String> ids = new ArrayList<>();
+            for (long id : objects) ids.add(hex(id));
+            m.put("candidateObjectIds", ids);
+            return m;
+        }
+        long objectId = objects.get(0);
+        Integer idx = a.model.indexOf(objectId);
+        m.put("status", "matched");
+        m.put("objectId", hex(objectId));
+        if (idx == null || a.dominators.unreachable[idx]) {
+            m.put("unreachable", true);
+            m.put("retainedBytes", null);
+            m.put("rootPath", null);
+            return m;
+        }
+        m.put("unreachable", false);
+        m.put("retainedBytes", a.dominators.retained[idx]);
+        List<PathFinder.Step> steps = PathFinder.shortestPathFromRoot(a.model, a.dominators, idx);
+        if (steps != null) {
+            Map<String, Object> path = new LinkedHashMap<>();
+            path.put("rootObjectId", steps.isEmpty() ? hex(objectId) : hex(steps.get(0).fromId()));
+            path.put("pathLength", steps.size());
+            path.put("edges", edgesJson(steps));
+            m.put("rootPath", path);
+        }
+        return m;
+    }
+
+    private static String instantOfNanos(long nanos) {
+        long sec = Math.floorDiv(nanos, 1_000_000_000L);
+        long nano = Math.floorMod(nanos, 1_000_000_000L);
+        return Instant.ofEpochSecond(sec, nano).toString();
     }
 
 

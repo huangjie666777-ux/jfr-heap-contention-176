@@ -1,6 +1,7 @@
 package heapx.model;
 
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 
 /**
@@ -22,12 +23,25 @@ public final class HeapModel {
     public final int[] inStart;
     public final int[] inFrom;
     public final String[] inLabel;
+    /** java.lang.Thread (and subclass) instances: declared long 'tid' -> thread object ids.
+     *  A tid mapping to more than one object is ambiguous. */
+    public final Map<Long, List<Long>> threadTids;
+    /** Thread instances whose declared 'tid' field was missing or unreadable. */
+    public final int threadsWithoutTid;
 
     private final Map<Long, Integer> byId;
 
     public HeapModel(long[] ids, String[] classNames, long[] shallow, boolean[] root,
                      int[] outStart, int[] outTo, String[] outLabel,
                      int[] inStart, int[] inFrom, String[] inLabel) {
+        this(ids, classNames, shallow, root, outStart, outTo, outLabel,
+                inStart, inFrom, inLabel, Map.of(), 0);
+    }
+
+    public HeapModel(long[] ids, String[] classNames, long[] shallow, boolean[] root,
+                     int[] outStart, int[] outTo, String[] outLabel,
+                     int[] inStart, int[] inFrom, String[] inLabel,
+                     Map<Long, List<Long>> threadTids, int threadsWithoutTid) {
         this.ids = ids;
         this.classNames = classNames;
         this.shallow = shallow;
@@ -38,6 +52,8 @@ public final class HeapModel {
         this.inStart = inStart;
         this.inFrom = inFrom;
         this.inLabel = inLabel;
+        this.threadTids = threadTids;
+        this.threadsWithoutTid = threadsWithoutTid;
         this.byId = new HashMap<>(ids.length * 2);
         for (int i = 0; i < ids.length; i++) byId.put(ids[i], i);
     }

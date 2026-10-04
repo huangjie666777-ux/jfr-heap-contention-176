@@ -156,8 +156,47 @@ public final class HprofParser {
             inFrom[inCursor[to]] = from;
             inLabel[inCursor[to]++] = label;
         }
+        // java.lang.Thread (and subclass) instances: read the declared long
+        // field 'tid' so JFR Java thread ids can be joined exactly.
+        Map<Long, List<Long>> threadTids = new HashMap<>();
+        int threadsWithoutTid = 0;
+        for (int i = 0; i < n; i++) {
+            Instance in = instances.get(i);
+            if (!isThreadOrSubclass(in.getJavaClass())) continue;
+            Long tid = declaredTid(in);
+            if (tid == null) {
+                threadsWithoutTid++;
+            } else {
+                threadTids.computeIfAbsent(tid, k -> new ArrayList<>()).add(ids[i]);
+            }
+        }
         return new HeapModel(ids, classNames, shallow, root,
-                outStart, outTo, outLabel, inStart, inFrom, inLabel);
+                outStart, outTo, outLabel, inStart, inFrom, inLabel,
+                threadTids, threadsWithoutTid);
+    }
+
+    private static boolean isThreadOrSubclass(JavaClass cls) {
+        for (JavaClass c = cls; c != null; c = c.getSuperClass()) {
+            if ("java.lang.Thread".equals(c.getName())) return true;
+        }
+        return false;
+    }
+
+    /** The value of the long field 'tid' declared by java.lang.Thread,
+     *  or null when the field is absent/unreadable. */
+    private static Long declaredTid(Instance in) {
+        for (Object fvObj : in.getFieldValues()) {
+            FieldValue fv = (FieldValue) fvObj;
+            Field f = fv.getField();
+            if (!"tid".equals(f.getName())) continue;
+            if (!"java.lang.Thread".equals(f.getDeclaringClass().getName())) continue;
+            try {
+                return Long.parseLong(fv.getValue().trim());
+            } catch (RuntimeException e) {
+                return null;
+            }
+        }
+        return null;
     }
 
     private AnalysisException edgeLimit(long count) {
